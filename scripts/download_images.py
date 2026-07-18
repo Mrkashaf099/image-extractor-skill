@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Image Extractor - Claude Code Skill
-Downloads 5 images from Google for a topic with aspect ratio filtering and dedup.
+Downloads 5 images from Bing, DuckDuckGo, and Unsplash
+with aspect ratio filtering and duplicate detection.
 """
 
 import os
@@ -11,7 +12,6 @@ import hashlib
 import argparse
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse, quote_plus
 
 
 # ── Auto-install dependencies ──────────────────────────────────────────────────
@@ -22,156 +22,250 @@ def install(pkg):
 try:
     import requests
 except ImportError:
-    print("Installing requests...")
-    install("requests")
-    import requests
+    print("Installing requests..."); install("requests"); import requests
 
 try:
     from PIL import Image
 except ImportError:
-    print("Installing Pillow...")
-    install("Pillow")
-    from PIL import Image
+    print("Installing Pillow..."); install("Pillow"); from PIL import Image
 
 try:
-    from icrawler.builtin import GoogleImageCrawler
+    from icrawler.builtin import BingImageCrawler
 except ImportError:
-    print("Installing icrawler...")
-    install("icrawler")
-    from icrawler.builtin import GoogleImageCrawler
+    print("Installing icrawler..."); install("icrawler"); from icrawler.builtin import BingImageCrawler
+
+from icrawler.builtin import BingImageCrawler
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path.home() / "Pictures" / "ImageExtractor"
 TARGET_COUNT = 5
-MAX_CANDIDATES = 25   # fetch extra to account for ratio/dedup filtering
+MAX_PER_SOURCE = 10
 METADATA_FILE = "metadata.json"
+UNSPLASH_ACCESS_KEY = "client-id"   # Public demo key (rate limited); user can replace
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def slugify(text: str) -> str:
-    """Convert topic to safe folder name."""
+def slugify(text):
     return text.lower().strip().replace(" ", "_").replace("/", "-")
 
-
-def get_ratio_filter(ratio: str):
-    """Return a function that checks if an image matches the target ratio."""
+def get_ratio_check(ratio):
     if ratio == "9:16":
-        return lambda w, h: h > w   # portrait: height > width
+        return lambda w, h: h > w
     elif ratio == "16:9":
-        return lambda w, h: w > h   # landscape: width > height
+        return lambda w, h: w > h
     else:
         raise ValueError(f"Unknown ratio '{ratio}'. Use '9:16' or '16:9'.")
 
-
-def md5_file(path: Path) -> str:
-    """Compute MD5 hash of a file."""
+def md5_file(path):
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 
-
-def load_metadata(folder: Path) -> dict:
-    """Load existing metadata (hashes + URLs already downloaded)."""
-    meta_path = folder / METADATA_FILE
-    if meta_path.exists():
-        with open(meta_path) as f:
+def load_metadata(folder):
+    p = folder / METADATA_FILE
+    if p.exists():
+        with open(p) as f:
             return json.load(f)
-    return {"hashes": [], "urls": [], "files": []}
+    return {"hashes": [], "files": [], "sources": []}
 
-
-def save_metadata(folder: Path, meta: dict):
-    """Save metadata to disk."""
+def save_metadata(folder, meta):
     with open(folder / METADATA_FILE, "w") as f:
         json.dump(meta, f, indent=2)
 
+def try_accept(path, ratio_check, known_hashes):
+    """Validate image: readable, correct ratio, not a duplicate. Returns hash or None."""
+    try:
+        img = Image.open(path)
+        w, h = img.size
+        img.close()
+    except Exception:
+        return None
+    if not ratio_check(w, h):
+        return None
+    file_hash = md5_file(path)
+    if file_hash in known_hashes:
+        return None
+    return file_hash
 
-# ── Core Download Logic ────────────────────────────────────────────────────────
 
-def download_images(topic: str, ratio: str) -> dict:
-    """
-    Main function: search Google, filter by ratio, dedup, save 5 images.
-    Returns a result summary dict.
-    """
-    ratio_check = get_ratio_filter(ratio)
+# ── Source: Bing ───────────────────────────────────────────────────────────────
+
+def fetch_bing(topic, temp_dir, count):
+    try:
+        crawler = BingImageCrawler(
+            storage={"root_dir": str(temp_dir)},
+            log_level=50,
+        )
+        crawler.crawl(keyword=topic, max_num=count, file_idx_offset=0)
+        return sorted(temp_dir.glob("*.*"))
+    except Exception as e:
+        print(f"  ⚠️  Bing error: {e}")
+        return []
+
+
+# ── Source: DuckDuckGo ─────────────────────────────────────────────────────────
+
+def fetch_duckduckgo(topic, temp_dir, count):
+    try:
+        # duckduckgo_search package
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            install("duckduckgo-search")
+            from duckduckgo_search import DDGS
+
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.images(topic, max_results=count):
+                results.append(r.get("image", ""))
+
+        saved = []
+        for i, url in enumerate(results):
+            if not url:
+                continue
+            try:
+                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    ext = ".jpg"
+                    dest = temp_dir / f"ddg_{i}{ext}"
+                    dest.write_bytes(resp.content)
+                    saved.append(dest)
+            except Exception:
+                continue
+        return saved
+    except Exception as e:
+        print(f"  ⚠️  DuckDuckGo error: {e}")
+        return []
+
+
+# ── Source: Unsplash ───────────────────────────────────────────────────────────
+
+def fetch_unsplash(topic, temp_dir, count):
+    try:
+        url = "https://api.unsplash.com/search/photos"
+        params = {
+            "query": topic,
+            "per_page": count,
+            "client_id": UNSPLASH_ACCESS_KEY,
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            print(f"  ⚠️  Unsplash API error: {resp.status_code}")
+            return []
+
+        results = resp.json().get("results", [])
+        saved = []
+        for i, item in enumerate(results):
+            img_url = item.get("urls", {}).get("regular", "")
+            if not img_url:
+                continue
+            try:
+                img_resp = requests.get(img_url, timeout=15)
+                if img_resp.status_code == 200:
+                    dest = temp_dir / f"unsplash_{i}.jpg"
+                    dest.write_bytes(img_resp.content)
+                    saved.append(dest)
+            except Exception:
+                continue
+        return saved
+    except Exception as e:
+        print(f"  ⚠️  Unsplash error: {e}")
+        return []
+
+
+# ── Core Logic ─────────────────────────────────────────────────────────────────
+
+def download_images(topic, ratio):
+    ratio_check = get_ratio_check(ratio)
     slug = slugify(topic)
     folder = BASE_DIR / slug
     folder.mkdir(parents=True, exist_ok=True)
 
     meta = load_metadata(folder)
     known_hashes = set(meta["hashes"])
-    known_urls   = set(meta["urls"])
 
-    # ── Use icrawler to fetch candidates into a temp subfolder ──────────────
-    temp_dir = folder / "_temp"
-    temp_dir.mkdir(exist_ok=True)
+    print(f"\n🔍 Topic     : \"{topic}\"")
+    print(f"📐 Ratio     : {ratio}")
+    print(f"📁 Folder    : {folder}")
+    print(f"🌐 Sources   : Bing → DuckDuckGo → Unsplash\n")
 
-    print(f"\n🔍 Searching Google Images for: \"{topic}\"")
-    print(f"📐 Aspect ratio filter: {ratio}")
-    print(f"📁 Output folder: {folder}\n")
-
-    crawler = GoogleImageCrawler(
-        storage={"root_dir": str(temp_dir)},
-        log_level=50,          # silence icrawler logs
-    )
-    crawler.crawl(
-        keyword=topic,
-        max_num=MAX_CANDIDATES,
-        file_idx_offset=0,
-    )
-
-    # ── Filter, dedup, and move accepted images ──────────────────────────────
-    candidates = sorted(temp_dir.glob("*.*"))
     accepted = 0
     skipped_ratio = 0
     skipped_dedup = 0
+    source_counts = {"Bing": 0, "DuckDuckGo": 0, "Unsplash": 0}
 
-    for candidate in candidates:
+    sources = [
+        ("Bing",       fetch_bing),
+        ("DuckDuckGo", fetch_duckduckgo),
+        ("Unsplash",   fetch_unsplash),
+    ]
+
+    for source_name, fetch_fn in sources:
         if accepted >= TARGET_COUNT:
             break
 
-        # Validate it's a real image
+        needed = TARGET_COUNT - accepted
+        temp_dir = folder / f"_temp_{source_name.lower()}"
+        temp_dir.mkdir(exist_ok=True)
+
+        print(f"  🔎 Trying {source_name}...")
+        candidates = fetch_fn(topic, temp_dir, MAX_PER_SOURCE)
+
+        for candidate in candidates:
+            if accepted >= TARGET_COUNT:
+                break
+            if not candidate.exists():
+                continue
+
+            file_hash = try_accept(candidate, ratio_check, known_hashes)
+
+            if file_hash is None:
+                # Figure out why it was skipped
+                try:
+                    img = Image.open(candidate)
+                    w, h = img.size
+                    img.close()
+                    if not ratio_check(w, h):
+                        skipped_ratio += 1
+                    else:
+                        skipped_dedup += 1
+                except Exception:
+                    pass
+                candidate.unlink(missing_ok=True)
+                continue
+
+            # Accept it
+            accepted += 1
+            ext = candidate.suffix.lower() or ".jpg"
+            dest = folder / f"image_{len(meta['files']) + 1}{ext}"
+            candidate.rename(dest)
+
+            known_hashes.add(file_hash)
+            meta["hashes"].append(file_hash)
+            meta["files"].append(dest.name)
+            meta["sources"].append(source_name)
+            source_counts[source_name] += 1
+
+            try:
+                img = Image.open(dest)
+                w, h = img.size
+                img.close()
+                print(f"     ✅ {dest.name}  ({w}×{h}px)  [{source_name}]")
+            except Exception:
+                print(f"     ✅ {dest.name}  [{source_name}]")
+
+        # Cleanup temp
+        for f in temp_dir.glob("*"):
+            f.unlink(missing_ok=True)
         try:
-            img = Image.open(candidate)
-            w, h = img.size
-            img.close()
+            temp_dir.rmdir()
         except Exception:
-            candidate.unlink(missing_ok=True)
-            continue
-
-        # Ratio filter
-        if not ratio_check(w, h):
-            skipped_ratio += 1
-            candidate.unlink(missing_ok=True)
-            continue
-
-        # Duplicate detection via MD5
-        file_hash = md5_file(candidate)
-        if file_hash in known_hashes:
-            skipped_dedup += 1
-            candidate.unlink(missing_ok=True)
-            continue
-
-        # Accept: move to final folder
-        accepted += 1
-        ext = candidate.suffix.lower() or ".jpg"
-        dest = folder / f"image_{len(meta['files']) + 1}{ext}"
-        candidate.rename(dest)
-
-        # Update metadata
-        known_hashes.add(file_hash)
-        meta["hashes"].append(file_hash)
-        meta["files"].append(dest.name)
-        print(f"  ✅ Saved: {dest.name}  ({w}×{h}px)")
-
-    # Cleanup temp dir
-    for leftover in temp_dir.glob("*"):
-        leftover.unlink(missing_ok=True)
-    temp_dir.rmdir()
+            pass
 
     save_metadata(folder, meta)
 
@@ -182,40 +276,30 @@ def download_images(topic: str, ratio: str) -> dict:
         "downloaded": accepted,
         "skipped_ratio": skipped_ratio,
         "skipped_duplicate": skipped_dedup,
+        "by_source": source_counts,
     }
 
 
-# ── CLI Entry Point ────────────────────────────────────────────────────────────
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Download images from Google for a topic."
-    )
-    parser.add_argument("--topic", required=True, help="Search topic")
-    parser.add_argument(
-        "--ratio",
-        required=True,
-        choices=["9:16", "16:9"],
-        help="Target aspect ratio: 9:16 (portrait) or 16:9 (landscape)",
-    )
+    parser = argparse.ArgumentParser(description="Download images from Bing, DuckDuckGo & Unsplash.")
+    parser.add_argument("--topic", required=True)
+    parser.add_argument("--ratio", required=True, choices=["9:16", "16:9"])
     args = parser.parse_args()
 
     result = download_images(args.topic, args.ratio)
 
-    print("\n" + "─" * 50)
+    print("\n" + "─" * 52)
     print(f"✅ Done!")
-    print(f"   Topic      : {result['topic']}")
-    print(f"   Ratio      : {result['ratio']}")
     print(f"   Downloaded : {result['downloaded']} / {TARGET_COUNT} images")
-    print(f"   Skipped    : {result['skipped_ratio']} (wrong ratio)  |  "
-          f"{result['skipped_duplicate']} (duplicates)")
+    print(f"   Skipped    : {result['skipped_ratio']} (wrong ratio)  |  {result['skipped_duplicate']} (duplicates)")
+    print(f"   By source  : Bing={result['by_source']['Bing']}  DDG={result['by_source']['DuckDuckGo']}  Unsplash={result['by_source']['Unsplash']}")
     print(f"   Saved to   : {result['folder']}")
-    print("─" * 50 + "\n")
+    print("─" * 52 + "\n")
 
     if result["downloaded"] < TARGET_COUNT:
-        print(f"⚠️  Only {result['downloaded']} image(s) found matching criteria.")
-        print("   Try a broader topic or run again for more results.\n")
-
+        print(f"⚠️  Only {result['downloaded']} image(s) matched. Try a broader topic.\n")
 
 if __name__ == "__main__":
     main()

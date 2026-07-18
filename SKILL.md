@@ -1,7 +1,7 @@
 ---
 name: image-extractor
 description: >
-  Downloads images from Google Images for any topic directly to the local filesystem.
+  Downloads images from Bing, DuckDuckGo, and Unsplash for any topic directly to the local filesystem.
   Use this skill whenever the user asks to: search and download images, fetch images
   for a topic, grab reference photos, collect images from Google, or says anything like
   "get me images of X", "download photos of X", "find and save images of X".
@@ -12,7 +12,7 @@ description: >
 
 # Image Extractor Skill
 
-Downloads images from Google Images for a given topic, saves them to a dedicated
+Downloads images from Bing, DuckDuckGo, and Unsplash for a given topic, saves them to a dedicated
 local folder, detects duplicates, and filters by aspect ratio (9:16 or 16:9).
 
 ---
