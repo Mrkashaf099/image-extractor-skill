@@ -5,7 +5,8 @@ Image Extractor - Claude Code Skill
 Termux-friendly version:
 - No icrawler / lxml / duckduckgo-search dependency
 - Uses only requests + Pillow
-- Saves to /storage/emulated/0/DCIM/manga/<topic>/ by default
+- Tries multiple public pages to discover direct image URLs
+- Saves to /storage/emulated/0/DCIM/manga/<topic>/ when available
 - Works on Python 3.14
 """
 
@@ -13,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
@@ -32,11 +35,39 @@ HEADERS = {
 }
 
 TARGET_COUNT = 5
-MAX_CANDIDATES = 40
+MAX_CANDIDATES = 80
 METADATA_FILE = "metadata.json"
-DEFAULT_BASE_DIR = Path("/storage/emulated/0/DCIM/manga")
-if not DEFAULT_BASE_DIR.exists():
-    DEFAULT_BASE_DIR = Path.home() / "DCIM" / "manga"
+
+
+def android_storage_base() -> Path:
+    candidates = [
+        Path("/storage/emulated/0/DCIM/manga"),
+        Path("/sdcard/DCIM/manga"),
+        Path.home() / "storage" / "shared" / "DCIM" / "manga",
+        Path.home() / "DCIM" / "manga",
+    ]
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            probe = base / ".write_test"
+            probe.write_text("1", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return base
+        except Exception:
+            continue
+    fallback = Path.home() / "DCIM" / "manga"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+DEFAULT_BASE_DIR = android_storage_base()
+
+
+IMAGE_EXT_RE = re.compile(r"\.(?:jpg|jpeg|png|webp|gif)(?:\?|$)", re.I)
+DIRECT_IMAGE_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\"'<>]*)?", re.I)
+META_IMAGE_RE = re.compile(r'"murl"\s*:\s*"(https?://[^"]+)"', re.I)
+SRC_IMAGE_RE = re.compile(r'(?:src|data-src|data-original)=["\'](https?://[^"\']+)["\']', re.I)
+BG_IMAGE_RE = re.compile(r'url\(["\']?(https?://[^"\')]+)["\']?\)', re.I)
 
 
 def slugify_folder_name(text: str) -> str:
@@ -74,31 +105,47 @@ def save_metadata(folder: Path, meta: dict) -> None:
     )
 
 
-def search_image_urls(topic: str, count: int = MAX_CANDIDATES):
-    """Try multiple public image endpoints and extract direct image URLs."""
-    query = f"{topic} high quality photo"
-    print(f'  🔍 Searching web for: "{query}"')
+def normalize_url(url: str) -> str:
+    return html.unescape(url.replace("\\/", "/").strip())
+
+
+def extract_urls_from_html(html_text: str) -> list[str]:
     urls = []
     seen = set()
+    patterns = [META_IMAGE_RE, SRC_IMAGE_RE, BG_IMAGE_RE, DIRECT_IMAGE_RE]
+    for pattern in patterns:
+        for match in pattern.findall(html_text):
+            url = normalize_url(match)
+            if not url.startswith("http"):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return urls
 
-    search_pages = [
+
+def discover_image_urls(topic: str, count: int = MAX_CANDIDATES) -> list[str]:
+    query = f"{topic} high quality photo"
+    print(f'  🔍 Searching web for: "{query}"')
+
+    pages = [
         f"https://www.bing.com/images/search?q={quote_plus(query)}&form=HDRSC2",
         f"https://duckduckgo.com/?q={quote_plus(query)}&iax=images&ia=images",
+        f"https://commons.wikimedia.org/w/index.php?search={quote_plus(query)}&title=Special:MediaSearch&go=Go&type=image",
+        f"https://www.pexels.com/search/{quote_plus(topic)}/",
+        f"https://pixabay.com/images/search/{quote_plus(topic)}/",
     ]
 
-    for page_url in search_pages:
+    urls = []
+    seen = set()
+    for page_url in pages:
         try:
             resp = requests.get(page_url, headers=HEADERS, timeout=20)
             if resp.status_code != 200:
                 continue
-            html = resp.text
-            found = re.findall(r'"murl"\s*:\s*"(https?://[^"]+)"', html)
-            if not found:
-                found = re.findall(r'https?://[^"\']+\.(?:jpg|jpeg|png|webp|gif)[^"\']*', html, re.I)
-            for url in found:
-                url = url.replace("\\/", "/")
-                if not url.startswith("http"):
-                    continue
+            candidates = extract_urls_from_html(resp.text)
+            for url in candidates:
                 if url in seen:
                     continue
                 seen.add(url)
@@ -185,7 +232,7 @@ def download_images(topic: str, ratio: str, base_dir: Path, count: int):
     print(f"   Folder : {folder}")
     print(f"{'─'*52}\n")
 
-    urls = search_image_urls(topic)
+    urls = discover_image_urls(topic, MAX_CANDIDATES)
 
     accepted = 0
     skipped_ratio = 0
@@ -194,50 +241,65 @@ def download_images(topic: str, ratio: str, base_dir: Path, count: int):
 
     print("\n  ⬇️  Downloading images...\n")
 
-    for url in urls:
-        if accepted >= count:
-            break
-        if url in known_urls:
-            skipped_dedup += 1
-            continue
-
+    def fetch_and_validate(url: str):
         data = None
         for _ in range(3):
             data = download_url(url)
             if data:
                 break
-            time.sleep(0.5)
-
+            time.sleep(0.4)
         if not data:
-            skipped_errors += 1
-            continue
-
+            return url, None, None, "error", None
         file_hash, reason, dims = validate_image(data, ratio_check, known_hashes)
-        if reason == "ratio":
-            skipped_ratio += 1
-            continue
-        if reason == "duplicate":
-            skipped_dedup += 1
-            continue
-        if reason == "corrupt":
-            skipped_errors += 1
-            continue
+        return url, data, file_hash, reason, dims
 
-        ext = detect_extension(url, data)
-        next_num = len(meta.get("files", [])) + 1
-        filename = f"{next_num:03d}{ext}"
-        path = folder / filename
-        path.write_bytes(data)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for url in urls:
+            if accepted >= count:
+                break
+            if url in known_urls:
+                skipped_dedup += 1
+                continue
+            futures.append(executor.submit(fetch_and_validate, url))
 
-        accepted += 1
-        known_hashes.add(file_hash)
-        known_urls.add(url)
-        meta.setdefault("hashes", []).append(file_hash)
-        meta.setdefault("files", []).append(filename)
-        meta.setdefault("urls", []).append(url)
+        for future in as_completed(futures):
+            if accepted >= count:
+                break
+            try:
+                url, data, file_hash, reason, dims = future.result()
+            except Exception:
+                skipped_errors += 1
+                continue
 
-        w, h = dims or (0, 0)
-        print(f"  ✅ {filename}  ({w}×{h}px)")
+            if reason == "error" or not data:
+                skipped_errors += 1
+                continue
+            if reason == "ratio":
+                skipped_ratio += 1
+                continue
+            if reason == "duplicate":
+                skipped_dedup += 1
+                continue
+            if reason == "corrupt":
+                skipped_errors += 1
+                continue
+
+            ext = detect_extension(url, data)
+            next_num = len(meta.get("files", [])) + 1
+            filename = f"{next_num:03d}{ext}"
+            path = folder / filename
+            path.write_bytes(data)
+
+            accepted += 1
+            known_hashes.add(file_hash)
+            known_urls.add(url)
+            meta.setdefault("hashes", []).append(file_hash)
+            meta.setdefault("files", []).append(filename)
+            meta.setdefault("urls", []).append(url)
+
+            w, h = dims or (0, 0)
+            print(f"  ✅ {filename}  ({w}×{h}px)")
 
     save_metadata(folder, meta)
 
