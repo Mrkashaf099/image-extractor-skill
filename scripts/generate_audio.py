@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Generate narration audio from script.txt using Gemini TTS.
-
-Expected environment variable:
-- GEMINI_API_KEY
+Generate narration audio using Gemini TTS.
 
 Usage:
-  python3 scripts/generate_audio.py --project-dir "/storage/emulated/0/DCIM/manga/Ancient Egypt"
 
-This script expects a text file at:
-  <project-dir>/script.txt
-and saves narration audio to:
-  <project-dir>/narration.wav
+export GEMINI_API_KEY="YOUR_API_KEY"
 
-Note: depending on the Gemini TTS output format available in your account/model,
-you may need to adjust the response handling.
+python3 scripts/generate_audio.py \
+    --project-dir "/storage/emulated/0/DCIM/manga/Ancient Egypt"
+
+Output:
+
+<project-dir>/narration.wav
 """
 
 from __future__ import annotations
@@ -23,102 +20,295 @@ import argparse
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 
 import requests
 
-GEMINI_TTS_ENDPOINT = (
+
+MODEL_NAME = "gemini-3.1-flash-tts-preview"
+
+GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash-exp:generateContent"
+    f"{MODEL_NAME}:generateContent"
 )
 
 
+# --------------------------------------------------------
+# Helpers
+# --------------------------------------------------------
+
 def load_script(project_dir: Path) -> str:
+
     script_path = project_dir / "script.txt"
+
     if not script_path.exists():
-        raise FileNotFoundError(f"Missing script file: {script_path}")
-    return script_path.read_text(encoding="utf-8")
+
+        raise FileNotFoundError(
+            f"Missing script:\n{script_path}"
+        )
+
+    return script_path.read_text(
+        encoding="utf-8"
+    )
 
 
-def generate_audio_bytes(script_text: str, api_key: str, voice_name: str) -> bytes:
-    payload = {
+def build_payload(
+    script_text: str,
+    voice_name: str,
+) -> dict:
+
+    return {
+
         "contents": [
+
             {
+
                 "parts": [
-                    {"text": script_text}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {
-                        "voiceName": voice_name
+
+                    {
+
+                        "text": script_text
+
                     }
-                }
+
+                ]
+
             }
-        },
+
+        ],
+
+        "generationConfig": {
+
+            "responseModalities": [
+
+                "AUDIO"
+
+            ],
+
+            "speechConfig": {
+
+                "voiceConfig": {
+
+                    "prebuiltVoiceConfig": {
+
+                        "voiceName": voice_name
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+# --------------------------------------------------------
+# Gemini TTS
+# --------------------------------------------------------
+
+def generate_audio_bytes(
+    script_text: str,
+    api_key: str,
+    voice_name: str,
+) -> bytes:
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
     }
 
-    resp = requests.post(
-        f"{GEMINI_TTS_ENDPOINT}?key={api_key}",
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
+    payload = build_payload(
+        script_text,
+        voice_name,
     )
-    resp.raise_for_status()
-    data = resp.json()
 
-    # Gemini audio responses can vary by model/version.
-    # We try a few likely locations for base64 audio bytes.
-    candidates = []
-    for item in data.get("candidates", []):
-        content = item.get("content", {}) if isinstance(item, dict) else {}
-        parts = content.get("parts", []) if isinstance(content, dict) else []
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            if "inlineData" in part and isinstance(part["inlineData"], dict):
-                inline = part["inlineData"]
-                mime = inline.get("mimeType", "")
-                b64 = inline.get("data")
-                if b64:
-                    candidates.append((mime, b64))
-            if "audio" in part and isinstance(part["audio"], dict):
-                audio = part["audio"]
-                mime = audio.get("mimeType", "")
-                b64 = audio.get("data")
-                if b64:
-                    candidates.append((mime, b64))
+    try:
+
+        response = requests.post(
+            GEMINI_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=300,
+        )
+
+    except requests.RequestException as e:
+
+        raise RuntimeError(
+            f"Network error:\n{e}"
+        )
+
+    if response.status_code != 200:
+
+        try:
+            error = response.json()
+        except Exception:
+            error = response.text
+
+        raise RuntimeError(
+            "Gemini TTS Error\n\n"
+            f"HTTP Status : {response.status_code}\n\n"
+            f"{json.dumps(error, indent=2, ensure_ascii=False)}"
+        )
+
+    data = response.json()
+
+    candidates = data.get(
+        "candidates",
+        [],
+    )
 
     if not candidates:
-        raise RuntimeError(f"No audio bytes found in Gemini response: {json.dumps(data)[:1000]}")
 
-    mime, b64 = candidates[0]
-    audio_bytes = base64.b64decode(b64)
-    return audio_bytes
+        raise RuntimeError(
+            "No candidates returned.\n\n"
+            + json.dumps(data, indent=2)[:4000]
+        )
 
+    audio_b64 = None
+
+    for candidate in candidates:
+
+        content = candidate.get(
+            "content",
+            {},
+        )
+
+        parts = content.get(
+            "parts",
+            [],
+        )
+
+        for part in parts:
+
+            if not isinstance(
+                part,
+                dict,
+            ):
+                continue
+
+            inline = part.get("inlineData")
+
+            if isinstance(
+                inline,
+                dict,
+            ):
+
+                audio_b64 = inline.get(
+                    "data"
+                )
+
+                if audio_b64:
+                    break
+
+            audio = part.get("audio")
+
+            if isinstance(
+                audio,
+                dict,
+            ):
+
+                audio_b64 = audio.get(
+                    "data"
+                )
+
+                if audio_b64:
+                    break
+
+        if audio_b64:
+            break
+
+    if not audio_b64:
+
+        raise RuntimeError(
+            "Gemini returned no audio.\n\n"
+            + json.dumps(data, indent=2)[:4000]
+        )
+
+    return base64.b64decode(audio_b64)
+# --------------------------------------------------------
+# Main
+# --------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate narration audio using Gemini TTS.")
-    parser.add_argument("--project-dir", required=True, help="Project folder containing script.txt")
-    parser.add_argument("--voice", default="Kore", help="Gemini voice name")
-    parser.add_argument("--output", default="narration.wav", help="Output audio filename")
+
+    parser = argparse.ArgumentParser(
+        description="Generate narration audio using Gemini TTS."
+    )
+
+    parser.add_argument(
+        "--project-dir",
+        required=True,
+        help="Project directory containing script.txt",
+    )
+
+    parser.add_argument(
+        "--voice",
+        default="Kore",
+        help="Gemini voice name",
+    )
+
+    parser.add_argument(
+        "--output",
+        default="narration.wav",
+        help="Output filename",
+    )
+
     args = parser.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get(
+        "GEMINI_API_KEY"
+    )
+
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in the environment.")
 
-    project_dir = Path(args.project_dir)
-    script_text = load_script(project_dir)
+        print(
+            "\nERROR: GEMINI_API_KEY is not set.\n"
+        )
 
-    audio_bytes = generate_audio_bytes(script_text, api_key, args.voice)
-    output_path = project_dir / args.output
-    output_path.write_bytes(audio_bytes)
+        sys.exit(1)
 
-    print(str(output_path))
+    project_dir = Path(
+        args.project_dir
+    )
+
+    script_text = load_script(
+        project_dir
+    )
+
+    print("\nGenerating narration...\n")
+
+    try:
+
+        audio_bytes = generate_audio_bytes(
+            script_text,
+            api_key,
+            args.voice,
+        )
+
+        output_path = (
+            project_dir / args.output
+        )
+
+        output_path.write_bytes(
+            audio_bytes
+        )
+
+    except Exception as e:
+
+        print("\nGeneration failed.\n")
+
+        print(e)
+
+        sys.exit(1)
+
+    print("===================================")
+    print(" Narration Generated Successfully")
+    print("===================================")
+
+    print(f"\nSaved : {output_path}")
+
+    print("\nDone.\n")
 
 
 if __name__ == "__main__":
