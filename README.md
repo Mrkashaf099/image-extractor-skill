@@ -1,8 +1,8 @@
 # 🖼️ Image Extractor — Claude Code Custom Skill
 
-A custom skill for **Claude Code** that searches Google Images for any topic and
-downloads 5 images directly to your local filesystem — with aspect ratio filtering
-and duplicate detection built in.
+A custom skill for **Claude Code** that finds and downloads images for any topic, then saves them into a topic-named folder on your device.
+
+This version is designed to be **Termux-friendly** and **Python 3.14 compatible**.
 
 ---
 
@@ -10,12 +10,12 @@ and duplicate detection built in.
 
 | Feature | Details |
 |--------|---------|
-| 🔍 Google Image Search | Searches Google Images for any topic |
-| 📁 Auto Folder Creation | Creates `~/Pictures/ImageExtractor/{topic}/` automatically |
+| 🔎 Multi-source image discovery | Tries multiple public web sources instead of depending on one image search engine |
+| 📁 Auto Folder Creation | Creates `/storage/emulated/0/DCIM/manga/{topic}/` automatically when available |
 | 📐 Aspect Ratio Filter | Choose `9:16` (portrait) or `16:9` (landscape) |
 | 🚫 Duplicate Detection | MD5 hash comparison prevents saving the same image twice |
-| 📦 5 Images Per Topic | Fetches up to 25 candidates to find 5 valid matches |
 | 🔁 Re-run Safe | Re-running skips already-downloaded images |
+| 📱 Termux-friendly | Designed to run on Android Termux without `icrawler`, `lxml`, or `duckduckgo-search` |
 
 ---
 
@@ -26,7 +26,7 @@ image-extractor-skill/
 ├── SKILL.md                    ← Claude Code skill definition
 ├── README.md                   ← This file
 ├── scripts/
-│   └── download_images.py      ← Core downloader (auto-installs deps)
+│   └── download_images.py      ← Core downloader
 └── references/
     └── setup.md                ← Manual setup & troubleshooting guide
 ```
@@ -73,16 +73,20 @@ Claude will:
 
 ## 📁 Output Structure
 
+By default on Android/Termux:
+
 ```
-~/Pictures/ImageExtractor/
-└── northern_lights/
-    ├── image_1.jpg
-    ├── image_2.jpg
-    ├── image_3.jpg
-    ├── image_4.jpg
-    ├── image_5.jpg
+/storage/emulated/0/DCIM/manga/
+└── northern lights/
+    ├── 001.jpg
+    ├── 002.jpg
+    ├── 003.jpg
+    ├── 004.jpg
+    ├── 005.jpg
     └── metadata.json
 ```
+
+If external storage is not available, it falls back to the home directory.
 
 ---
 
@@ -93,38 +97,35 @@ You can also run the script directly without Claude Code:
 ```bash
 python3 scripts/download_images.py --topic "northern lights" --ratio "16:9"
 python3 scripts/download_images.py --topic "city skyline" --ratio "9:16"
+python3 scripts/download_images.py --topic "Trump speaking at conference" --ratio "16:9" --count 20
 ```
 
 ---
 
 ## 📦 Dependencies
 
-Auto-installed on first run:
-- `requests`
-- `Pillow`
-- `icrawler`
+Install manually:
 
-Or install manually:
 ```bash
-pip install requests Pillow icrawler
+pip install requests Pillow
 ```
 
 ---
 
 ## 📋 Requirements
 
-- Python 3.8+
+- Python 3.14+
 - Claude Code with custom skills enabled
 - Internet connection
+- Termux storage permission if saving to `/storage/emulated/0/DCIM/manga/`
 
 ---
 
 ## 🛠️ Troubleshooting
 
-See [`references/setup.md`](references/setup.md) for:
-- Manual dependency installation
-- Google rate limiting workarounds
-- Metadata reset instructions
+- Run `termux-setup-storage` and allow storage access.
+- If the folder falls back to your home directory, Android storage access is not active.
+- If too few images are found, try a broader topic or a different ratio.
 
 ---
 
