@@ -3,8 +3,8 @@
 Image Extractor - Claude Code Skill
 
 Termux-friendly version:
-- No icrawler / lxml dependency
-- Downloads images using requests only
+- No icrawler / lxml / duckduckgo-search dependency
+- Uses only requests + Pillow
 - Saves to /storage/emulated/0/DCIM/manga/<topic>/ by default
 - Works on Python 3.14
 """
@@ -14,34 +14,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
-import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
-
-try:
-    import requests
-except ImportError:
-    print("Missing dependency: requests")
-    print("Install it with: pip install requests")
-    raise
-
-try:
-    from PIL import Image
-except ImportError:
-    print("Missing dependency: Pillow")
-    print("Install it with: pip install Pillow")
-    raise
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    print("Missing dependency: duckduckgo-search")
-    print("Install it with: pip install duckduckgo-search")
-    raise
+import requests
+from PIL import Image
 
 
 HEADERS = {
@@ -55,7 +34,6 @@ HEADERS = {
 TARGET_COUNT = 5
 MAX_CANDIDATES = 40
 METADATA_FILE = "metadata.json"
-
 DEFAULT_BASE_DIR = Path("/storage/emulated/0/DCIM/manga")
 if not DEFAULT_BASE_DIR.exists():
     DEFAULT_BASE_DIR = Path.home() / "DCIM" / "manga"
@@ -66,12 +44,6 @@ def slugify_folder_name(text: str) -> str:
     text = re.sub(r"[\\/:*?\"<>|]+", "_", text)
     text = re.sub(r"\s+", " ", text)
     return text[:120] if len(text) > 120 else text
-
-
-def slugify_filename(text: str) -> str:
-    text = text.strip().lower()
-    text = re.sub(r"[^a-z0-9._-]+", "_", text)
-    return text.strip("_") or "image"
 
 
 def md5_bytes(data: bytes) -> str:
@@ -103,26 +75,40 @@ def save_metadata(folder: Path, meta: dict) -> None:
 
 
 def search_image_urls(topic: str, count: int = MAX_CANDIDATES):
+    """Try multiple public image endpoints and extract direct image URLs."""
     query = f"{topic} high quality photo"
     print(f'  🔍 Searching web for: "{query}"')
     urls = []
     seen = set()
 
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.images(keywords=query, max_results=count)
-            for r in results:
-                url = r.get("image") or r.get("thumbnail") or r.get("url")
-                if not url or not isinstance(url, str):
-                    continue
+    search_pages = [
+        f"https://www.bing.com/images/search?q={quote_plus(query)}&form=HDRSC2",
+        f"https://duckduckgo.com/?q={quote_plus(query)}&iax=images&ia=images",
+    ]
+
+    for page_url in search_pages:
+        try:
+            resp = requests.get(page_url, headers=HEADERS, timeout=20)
+            if resp.status_code != 200:
+                continue
+            html = resp.text
+            found = re.findall(r'"murl"\s*:\s*"(https?://[^"]+)"', html)
+            if not found:
+                found = re.findall(r'https?://[^"\']+\.(?:jpg|jpeg|png|webp|gif)[^"\']*', html, re.I)
+            for url in found:
+                url = url.replace("\\/", "/")
                 if not url.startswith("http"):
                     continue
                 if url in seen:
                     continue
                 seen.add(url)
                 urls.append(url)
-    except Exception as e:
-        print(f"  ⚠️  Search error: {e}")
+                if len(urls) >= count:
+                    break
+        except Exception as e:
+            print(f"  ⚠️  Search error: {e}")
+        if len(urls) >= count:
+            break
 
     print(f"  📋 Found {len(urls)} candidate URLs")
     return urls
@@ -145,13 +131,12 @@ def download_url(url: str, timeout: int = 20) -> bytes | None:
 
 
 def detect_extension(url: str, data: bytes) -> str:
-    parsed = urlparse(url)
-    ext = Path(parsed.path).suffix.lower()
+    ext = Path(urlparse(url).path).suffix.lower()
     if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
         return ".jpg" if ext == ".jpeg" else ext
-
     try:
-        img = Image.open(sys.modules["io"].BytesIO(data))
+        from io import BytesIO
+        img = Image.open(BytesIO(data))
         fmt = (img.format or "JPEG").upper()
         img.close()
         return {
@@ -209,7 +194,7 @@ def download_images(topic: str, ratio: str, base_dir: Path, count: int):
 
     print("\n  ⬇️  Downloading images...\n")
 
-    for idx, url in enumerate(urls, start=1):
+    for url in urls:
         if accepted >= count:
             break
         if url in known_urls:
@@ -268,33 +253,14 @@ def download_images(topic: str, ratio: str, base_dir: Path, count: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Search the web for images and download them directly."
-    )
+    parser = argparse.ArgumentParser(description="Search the web for images and download them directly.")
     parser.add_argument("--topic", required=True, help="Search topic")
-    parser.add_argument(
-        "--ratio", required=True, choices=["9:16", "16:9"],
-        help="Aspect ratio: 9:16 (portrait) or 16:9 (landscape)"
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=str(DEFAULT_BASE_DIR),
-        help="Output base directory (default: /storage/emulated/0/DCIM/manga)",
-    )
-    parser.add_argument(
-        "--count",
-        type=int,
-        default=TARGET_COUNT,
-        help="Number of images to save (default: 5)",
-    )
+    parser.add_argument("--ratio", required=True, choices=["9:16", "16:9"], help="Aspect ratio")
+    parser.add_argument("--output-dir", default=str(DEFAULT_BASE_DIR), help="Output base directory")
+    parser.add_argument("--count", type=int, default=TARGET_COUNT, help="Number of images to save")
     args = parser.parse_args()
 
-    result = download_images(
-        topic=args.topic,
-        ratio=args.ratio,
-        base_dir=Path(args.output_dir),
-        count=args.count,
-    )
+    result = download_images(args.topic, args.ratio, Path(args.output_dir), args.count)
 
     print(f"\n{'─'*52}")
     print("✅ Complete!")
