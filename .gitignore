@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Downloaded images (don't commit actual images)
+~/Pictures/ImageExtractor/
+
+# OS files
+.DS_Store
+Thumbs.db
