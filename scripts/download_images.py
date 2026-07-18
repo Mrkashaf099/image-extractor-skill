@@ -2,25 +2,26 @@
 """
 Image Extractor - Claude Code Skill
 
-Termux-friendly version:
-- No icrawler / lxml / duckduckgo-search dependency
-- Uses only requests + Pillow
-- Tries multiple public pages to discover direct image URLs
-- Saves to /storage/emulated/0/DCIM/manga/<topic>/ when available
-- Works on Python 3.14
+Termux-friendly downloader using SerpAPI image results.
+Requires:
+  - requests
+  - Pillow
+API key:
+  - SERPAPI_API_KEY environment variable
+
+Saves to /storage/emulated/0/DCIM/manga/<topic>/ when available.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import html
 import json
+import os
 import re
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlparse
 
 import requests
 from PIL import Image
@@ -35,8 +36,8 @@ HEADERS = {
 }
 
 TARGET_COUNT = 5
-MAX_CANDIDATES = 80
 METADATA_FILE = "metadata.json"
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 
 def android_storage_base() -> Path:
@@ -61,13 +62,6 @@ def android_storage_base() -> Path:
 
 
 DEFAULT_BASE_DIR = android_storage_base()
-
-
-IMAGE_EXT_RE = re.compile(r"\.(?:jpg|jpeg|png|webp|gif)(?:\?|$)", re.I)
-DIRECT_IMAGE_RE = re.compile(r"https?://[^\s\"'<>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\"'<>]*)?", re.I)
-META_IMAGE_RE = re.compile(r'"murl"\s*:\s*"(https?://[^"]+)"', re.I)
-SRC_IMAGE_RE = re.compile(r'(?:src|data-src|data-original)=["\'](https?://[^"\']+)["\']', re.I)
-BG_IMAGE_RE = re.compile(r'url\(["\']?(https?://[^"\')]+)["\']?\)', re.I)
 
 
 def slugify_folder_name(text: str) -> str:
@@ -105,78 +99,6 @@ def save_metadata(folder: Path, meta: dict) -> None:
     )
 
 
-def normalize_url(url: str) -> str:
-    return html.unescape(url.replace("\\/", "/").strip())
-
-
-def extract_urls_from_html(html_text: str) -> list[str]:
-    urls = []
-    seen = set()
-    patterns = [META_IMAGE_RE, SRC_IMAGE_RE, BG_IMAGE_RE, DIRECT_IMAGE_RE]
-    for pattern in patterns:
-        for match in pattern.findall(html_text):
-            url = normalize_url(match)
-            if not url.startswith("http"):
-                continue
-            if url in seen:
-                continue
-            seen.add(url)
-            urls.append(url)
-    return urls
-
-
-def discover_image_urls(topic: str, count: int = MAX_CANDIDATES) -> list[str]:
-    query = f"{topic} high quality photo"
-    print(f'  🔍 Searching web for: "{query}"')
-
-    pages = [
-        f"https://www.bing.com/images/search?q={quote_plus(query)}&form=HDRSC2",
-        f"https://duckduckgo.com/?q={quote_plus(query)}&iax=images&ia=images",
-        f"https://commons.wikimedia.org/w/index.php?search={quote_plus(query)}&title=Special:MediaSearch&go=Go&type=image",
-        f"https://www.pexels.com/search/{quote_plus(topic)}/",
-        f"https://pixabay.com/images/search/{quote_plus(topic)}/",
-    ]
-
-    urls = []
-    seen = set()
-    for page_url in pages:
-        try:
-            resp = requests.get(page_url, headers=HEADERS, timeout=20)
-            if resp.status_code != 200:
-                continue
-            candidates = extract_urls_from_html(resp.text)
-            for url in candidates:
-                if url in seen:
-                    continue
-                seen.add(url)
-                urls.append(url)
-                if len(urls) >= count:
-                    break
-        except Exception as e:
-            print(f"  ⚠️  Search error: {e}")
-        if len(urls) >= count:
-            break
-
-    print(f"  📋 Found {len(urls)} candidate URLs")
-    return urls
-
-
-def download_url(url: str, timeout: int = 20) -> bytes | None:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        content_type = resp.headers.get("Content-Type", "")
-        if "image" not in content_type.lower():
-            return None
-        data = resp.content
-        if len(data) < 4096:
-            return None
-        return data
-    except Exception:
-        return None
-
-
 def detect_extension(url: str, data: bytes) -> str:
     ext = Path(urlparse(url).path).suffix.lower()
     if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
@@ -195,6 +117,84 @@ def detect_extension(url: str, data: bytes) -> str:
         }.get(fmt, ".jpg")
     except Exception:
         return ".jpg"
+
+
+def serpapi_image_urls(topic: str, api_key: str, count: int):
+    params = {
+        "engine": "google_images",
+        "q": topic,
+        "api_key": api_key,
+        "ijn": 0,
+    }
+    urls = []
+    seen = set()
+
+    while len(urls) < count:
+        resp = requests.get(SERPAPI_ENDPOINT, params=params, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        images = data.get("images_results", []) or []
+        if not images:
+            break
+
+        for item in images:
+            url = item.get("original") or item.get("thumbnail") or item.get("link")
+            if not url or not isinstance(url, str):
+                continue
+            if not url.startswith("http"):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+            if len(urls) >= count:
+                break
+
+        next_page = data.get("serpapi_pagination", {}).get("next")
+        if not next_page:
+            break
+        params = None
+        if len(urls) < count:
+            resp2 = requests.get(next_page, headers=HEADERS, timeout=30)
+            resp2.raise_for_status()
+            data = resp2.json()
+            images = data.get("images_results", []) or []
+            if not images:
+                break
+            for item in images:
+                url = item.get("original") or item.get("thumbnail") or item.get("link")
+                if not url or not isinstance(url, str):
+                    continue
+                if not url.startswith("http"):
+                    continue
+                if url in seen:
+                    continue
+                seen.add(url)
+                urls.append(url)
+                if len(urls) >= count:
+                    break
+            if not data.get("serpapi_pagination", {}).get("next"):
+                break
+            params = None
+            break
+
+    return urls[:count]
+
+
+def download_url(url: str, timeout: int = 25) -> bytes | None:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type.lower():
+            return None
+        data = resp.content
+        if len(data) < 4096:
+            return None
+        return data
+    except Exception:
+        return None
 
 
 def validate_image(data: bytes, ratio_check, known_hashes: set[str]):
@@ -216,7 +216,7 @@ def validate_image(data: bytes, ratio_check, known_hashes: set[str]):
     return file_hash, "ok", (w, h)
 
 
-def download_images(topic: str, ratio: str, base_dir: Path, count: int):
+def download_images(topic: str, ratio: str, base_dir: Path, count: int, api_key: str):
     ratio_check = get_ratio_check(ratio)
     folder = base_dir / slugify_folder_name(topic)
     folder.mkdir(parents=True, exist_ok=True)
@@ -232,7 +232,7 @@ def download_images(topic: str, ratio: str, base_dir: Path, count: int):
     print(f"   Folder : {folder}")
     print(f"{'─'*52}\n")
 
-    urls = discover_image_urls(topic, MAX_CANDIDATES)
+    urls = serpapi_image_urls(topic, api_key, max(count * 5, 25))
 
     accepted = 0
     skipped_ratio = 0
@@ -247,7 +247,6 @@ def download_images(topic: str, ratio: str, base_dir: Path, count: int):
             data = download_url(url)
             if data:
                 break
-            time.sleep(0.4)
         if not data:
             return url, None, None, "error", None
         file_hash, reason, dims = validate_image(data, ratio_check, known_hashes)
@@ -322,7 +321,11 @@ def main():
     parser.add_argument("--count", type=int, default=TARGET_COUNT, help="Number of images to save")
     args = parser.parse_args()
 
-    result = download_images(args.topic, args.ratio, Path(args.output_dir), args.count)
+    api_key = os.environ.get("SERPAPI_API_KEY")
+    if not api_key:
+        raise RuntimeError("SERPAPI_API_KEY is not set in the environment.")
+
+    result = download_images(args.topic, args.ratio, Path(args.output_dir), args.count, api_key)
 
     print(f"\n{'─'*52}")
     print("✅ Complete!")
