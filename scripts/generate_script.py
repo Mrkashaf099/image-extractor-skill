@@ -347,9 +347,9 @@ def build_prompt_extended(
 
     Args:
         topic:         Documentary topic (same as original).
-        style:         Writing style (documentary / cinematic / …).
-        tone:          Emotional tone (professional / dramatic / …).
-        audience:      Target audience (general / children / …).
+        style:         Writing style (documentary / cinematic / ...).
+        tone:          Emotional tone (professional / dramatic / ...).
+        audience:      Target audience (general / children / ...).
         language:      Output language (e.g. "English", "Spanish").
         output_format: Output format (plain / markdown / json / sections).
         word_count:    Target word count, or None for no constraint.
@@ -359,17 +359,18 @@ def build_prompt_extended(
     """
 
     # Gather optional instruction lines (skip empty strings)
-    extra_lines: list[str] = [
-        line for line in [
-            _style_line     := _STYLE_INSTRUCTIONS.get(style, ""),
-            _tone_line      := _TONE_INSTRUCTIONS.get(tone, ""),
-            _audience_line  := _AUDIENCE_INSTRUCTIONS.get(audience, ""),
-            _language_line  := _language_instruction(language),
-            _wc_line        := _word_count_instruction(word_count),
-            _format_line    := _FORMAT_INSTRUCTIONS.get(output_format, ""),
-        ]
-        if line
+    # NOTE: plain list assignment used here — walrus operator (:=) inside
+    # a comprehension iterable is a syntax error in Python and must not
+    # be used. Each line is evaluated separately, then filtered.
+    _candidate_lines: list[str] = [
+        _STYLE_INSTRUCTIONS.get(style, ""),
+        _TONE_INSTRUCTIONS.get(tone, ""),
+        _AUDIENCE_INSTRUCTIONS.get(audience, ""),
+        _language_instruction(language),
+        _word_count_instruction(word_count),
+        _FORMAT_INSTRUCTIONS.get(output_format, ""),
     ]
+    extra_lines: list[str] = [line for line in _candidate_lines if line]
 
     # Format lines as bullet points to match the original prompt style
     extra_block = "\n".join(f"• {line}" for line in extra_lines)
@@ -635,14 +636,14 @@ def _call_gemini(prompt: str, api_key: str) -> str:
 def generate_script_extended(
     topic:       str,
     api_key:     str,
-    style:       str          = _DEFAULT_STYLE,
-    tone:        str          = _DEFAULT_TONE,
-    audience:    str          = _DEFAULT_AUDIENCE,
-    language:    str          = _DEFAULT_LANGUAGE,
-    output_format: str        = _DEFAULT_FORMAT,
-    duration:    Optional[int]= None,
-    voice_speed: str          = _DEFAULT_SPEED,
-    max_retries: int          = 1,
+    style:       str           = _DEFAULT_STYLE,
+    tone:        str           = _DEFAULT_TONE,
+    audience:    str           = _DEFAULT_AUDIENCE,
+    language:    str           = _DEFAULT_LANGUAGE,
+    output_format: str         = _DEFAULT_FORMAT,
+    duration:    Optional[int] = None,
+    voice_speed: str           = _DEFAULT_SPEED,
+    max_retries: int           = 1,
 ) -> str:
     """
     Extended version of generate_script() with new parameters.
@@ -696,7 +697,7 @@ def generate_script_extended(
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
-                # Exponential backoff: 2s, 4s, 8s, …
+                # Exponential backoff: 2s, 4s, 8s, ...
                 wait = 2 ** (attempt - 1)
                 print(
                     f"Retry {attempt}/{max_retries} "
@@ -802,14 +803,14 @@ Argument reference
   --tone          Tone     : professional (default), dramatic, inspirational,
                              neutral, suspenseful
   --audience      Audience : general (default), children, students, experts
-  --language      Language : English (default), Spanish, French, German, …
+  --language      Language : English (default), Spanish, French, German, ...
   --format        Format   : plain (default), markdown, json, sections
   --voice-speed   Speed    : slow, normal (default), fast
-  --max-retries   Retries  : integer ≥ 1 (default: 1)
+  --max-retries   Retries  : integer >= 1 (default: 1)
 """,
     )
 
-    # ── Original arguments (preserved verbatim) ──────────────────────────
+    # -- Original arguments (preserved verbatim) ---------------------------
 
     parser.add_argument(
         "--topic",
@@ -823,7 +824,7 @@ Argument reference
         help="Directory where the project folder will be created",
     )
 
-    # ── New optional arguments ────────────────────────────────────────────
+    # -- New optional arguments --------------------------------------------
 
     parser.add_argument(
         "--duration",
@@ -914,23 +915,23 @@ Argument reference
         metavar="N",
         help=(
             "Maximum number of API call attempts with exponential backoff "
-            "(2s, 4s, 8s, …). Must be ≥ 1. Default: 1"
+            "(2s, 4s, 8s, ...). Must be >= 1. Default: 1"
         ),
     )
 
     args = parser.parse_args()
 
-    # ── Validate new arguments ────────────────────────────────────────────
+    # -- Validate new arguments --------------------------------------------
 
     if args.duration is not None and args.duration <= 0:
         print("\nERROR: --duration must be a positive integer (seconds).\n")
         sys.exit(1)
 
     if args.max_retries < 1:
-        print("\nERROR: --max-retries must be ≥ 1.\n")
+        print("\nERROR: --max-retries must be >= 1.\n")
         sys.exit(1)
 
-    # ── API key check (unchanged) ─────────────────────────────────────────
+    # -- API key check (unchanged) ----------------------------------------
 
     api_key = os.environ.get("GEMINI_API_KEY")
 
@@ -946,7 +947,7 @@ Argument reference
 
         sys.exit(1)
 
-    # ── Output directory setup (unchanged) ────────────────────────────────
+    # -- Output directory setup (unchanged) --------------------------------
 
     output_dir = Path(args.output_dir)
 
@@ -955,7 +956,7 @@ Argument reference
         exist_ok=True,
     )
 
-    # ── Progress output ───────────────────────────────────────────────────
+    # -- Progress output ---------------------------------------------------
 
     print("\nGenerating documentary script...\n")
 
@@ -983,7 +984,7 @@ Argument reference
             print(f"  Max retries : {args.max_retries}")
         print()
 
-    # ── Generation ────────────────────────────────────────────────────────
+    # -- Generation --------------------------------------------------------
 
     try:
 
@@ -1014,7 +1015,7 @@ Argument reference
 
         sys.exit(1)
 
-    # ── Success output (original format preserved) ────────────────────────
+    # -- Success output (original format preserved) ------------------------
 
     print("===================================")
     print(" Script Generated Successfully")
